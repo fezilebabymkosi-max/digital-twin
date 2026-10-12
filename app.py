@@ -12,7 +12,7 @@ from google.genai import types
 from config.persona import get_system_instruction, USER_PROFILE
 from memory.store import MemoryStore
 from tools.productivity import ProductivityTools
-from tools.proposals import ProposalEngine
+# from tools.proposals import ProposalEngine
 
 load_dotenv()
 
@@ -25,7 +25,7 @@ class DigitalTwin:
         
         self.memory = MemoryStore()
         self.tools = ProductivityTools()
-        self.proposal_engine = ProposalEngine()
+        #self.proposal_engine = ProposalEngine()
         self.mode = mode
         self.system_instruction = get_system_instruction(mode)
 
