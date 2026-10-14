@@ -1,133 +1,103 @@
-"""
-app.py
-Main Orchestrator for your Digital Twin.
-Supports interactive mode switching (Client Pitch, Daily Planner, General Q&A).
-"""
-
 import os
-from dotenv import load_dotenv
+import time
+import streamlit as st
 from google import genai
 from google.genai import types
+from dotenv import load_dotenv
+import chromadb
 
-from config.persona import get_system_instruction, USER_PROFILE
-from memory.store import MemoryStore
-from tools.productivity import ProductivityTools
-from tools.proposals import ProposalEngine
+# Force reload of environment variables
+load_dotenv(override=True)
+api_key = os.getenv("GEMINI_API_KEY")
 
-load_dotenv()
+if not api_key:
+    st.error("GEMINI_API_KEY is missing from your .env file!")
+    st.stop()
 
-class DigitalTwin:
-    def __init__(self, mode: str = "default"):
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            raise ValueError("GEMINI_API_KEY missing from environment variables.")
-        self.client = genai.Client(api_key=api_key)
-        
-        self.memory = MemoryStore()
-        self.tools = ProductivityTools()
-        self.proposal_engine = ProposalEngine()
-        self.mode = mode
-        self.system_instruction = get_system_instruction(mode)
+# Initialize Google GenAI client
+client = genai.Client(api_key=api_key)
 
-    def set_mode(self, mode: str):
-        """Switches operational mode dynamically."""
-        self.mode = mode
-        self.system_instruction = get_system_instruction(mode)
-        print(f"\n[System] Digital Twin switched to '{mode}' mode.")
+# Models tried in order. First one that answers is used.
+CANDIDATE_MODELS = ["gemini-3.5-flash", "gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 
-    def generate_response(self, user_prompt: str) -> str:
-        """Retrieves memory context from ChromaDB and generates a response."""
-        retrieved_docs = self.memory.query_memory(user_prompt, n_results=2)
-        context_str = "\n".join([f"- {doc}" for doc in retrieved_docs]) if retrieved_docs else "No specific memory found."
+# Initialize ChromaDB Vector Memory Store
+@st.cache_resource
+def get_vector_store():
+    chroma_client = chromadb.PersistentClient(path="./memory/chroma_db")
+    return chroma_client.get_or_create_collection(name="persona_memory")
 
-        augmented_prompt = f"""
-### RETRIEVED MEMORY CONTEXT
-{context_str}
+try:
+    collection = get_vector_store()
+except Exception:
+    collection = None
 
-### USER INPUT
-{user_prompt}
+st.set_page_config(page_title="Digital Twin Workspace", page_icon="🤖")
+st.title("Fezile Mkosi — Digital Twin Dashboard")
+
+# Initialize Chat Memory
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# Display Prior Messages
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+# Handle User Input
+if prompt := st.chat_input("Ask your Digital Twin a question..."):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        message_placeholder = st.empty()
+
+        # 1. Retrieve Context from ChromaDB Memory
+        retrieved_context = ""
+        if collection and collection.count() > 0:
+            results = collection.query(query_texts=[prompt], n_results=2)
+            if results and "documents" in results and results["documents"]:
+                retrieved_context = "\n".join(results["documents"][0])
+
+        # 2. Build Grounded Persona Instruction
+        system_instruction = f"""
+You are the Digital Twin of Fezile Mkosi (Salesforce Operations Specialist & WordPress Web Designer).
+Answer in the first person ("I") based on this background context:
+
+--- PERSONA CONTEXT ---
+{retrieved_context if retrieved_context else "No specific vector store documents returned. Answer professionally as Fezile."}
+-----------------------
 """
 
-        # Primary attempt with gemini-3.8-flash; fallback to gemini-flash-latest
-        try:
-            response = self.client.models.generate_content(
-                model="gemini-3.8-flash",
-                contents=augmented_prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=self.system_instruction,
-                    temperature=0.3
-                )
-            )
-        except Exception as e:
-            print(f"\n[Notice: Primary model unavailable ({type(e).__name__}), switching to fallback 'gemini-flash-latest'...]")
-            try:
-                response = self.client.models.generate_content(
-                    model="gemini-flash-latest",
-                    contents=augmented_prompt,
-                    config=types.GenerateContentConfig(
-                        system_instruction=self.system_instruction,
-                        temperature=0.3
+                # 3. Model call with retries, fallback and full error reporting
+        response_text = None
+        errors = []
+
+        for model_id in CANDIDATE_MODELS:
+            for attempt in range(3):
+                try:
+                    response = client.models.generate_content(
+                        model=model_id,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            system_instruction=system_instruction
+                        ),
                     )
-                )
-            except Exception as fallback_err:
-                return f"API Error: Both primary and fallback models are currently busy. Please try again in a few moments. ({fallback_err})"
+                    response_text = response.text
+                    break
+                except Exception as e:
+                    msg = str(e)
+                    errors.append(f"{model_id} (try {attempt + 1}): {msg[:150]}")
+                    # Only retry on temporary overload / rate limit
+                    if "503" in msg or "UNAVAILABLE" in msg or "429" in msg:
+                        time.sleep(2 * (attempt + 1))
+                        continue
+                    break  # permanent error (e.g. 404): go to next model
+            if response_text:
+                break
 
-        return response.text
-
-    def draft_client_pitch(self, job_description: str) -> str:
-        """Dedicated workflow for drafting client pitches."""
-        self.set_mode("client_pitch")
-        formatted_prompt = self.proposal_engine.format_proposal_prompt(job_description)
-        return self.generate_response(formatted_prompt)
-
-    def run_daily_planner(self, raw_notes: str) -> str:
-        """Dedicated workflow for daily executive briefing."""
-        self.set_mode("daily_planner")
-        return self.run_daily_dashboard(raw_notes)
-
-    def run_daily_dashboard(self, raw_notes: str = "") -> str:
-        income_routes = self.tools.map_skills_to_income(USER_PROFILE["skills"])
-        tasks = self.tools.extract_action_items(raw_notes) if raw_notes else []
-        retrieved_context = self.memory.query_memory("skills background experience", n_results=2)
-        
-        return self.tools.format_daily_briefing(
-            user_name=USER_PROFILE["name"],
-            tasks=tasks,
-            income_routes=income_routes,
-            retrieved_context=retrieved_context
-        )
-
-
-if __name__ == "__main__":
-    twin = DigitalTwin()
-    print("\n==========================================")
-    print("      DIGITAL TWIN INTERACTIVE CLI        ")
-    print("==========================================")
-    print("Commands:")
-    print("  'pitch'   - Switch to Client Pitch Mode")
-    print("  'plan'    - Switch to Daily Planner Mode")
-    print("  'general' - Switch to General Mode")
-    print("  'exit'    - Quit Application\n")
-
-    while True:
-        user_input = input("\nAsk Digital Twin > ").strip()
-        
-        if not user_input:
-            continue
-            
-        if user_input.lower() in ["exit", "quit"]:
-            print("Shutting down Digital Twin...")
-            break
-        elif user_input.lower() == "pitch":
-            job_desc = input("\nPaste Client Job Description / Requirements:\n> ")
-            print("\nGenerating Client Pitch...\n")
-            print(twin.draft_client_pitch(job_desc))
-        elif user_input.lower() == "plan":
-            notes = input("\nPaste today's raw tasks/notes:\n> ")
-            print("\nGenerating Daily Plan...\n")
-            print(twin.run_daily_planner(notes))
-        elif user_input.lower() == "general":
-            twin.set_mode("default")
+        if response_text:
+            message_placeholder.markdown(response_text)
+            st.session_state.messages.append({"role": "assistant", "content": response_text})
         else:
-            print("\nDigital Twin Response:\n")
-            print(twin.generate_response(user_input))
+            st.error("All models failed:\n\n" + "\n\n".join(errors))
